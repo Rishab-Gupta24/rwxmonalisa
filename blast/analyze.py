@@ -351,11 +351,147 @@ def qualname_of(tree, node) -> str:
     return ".".join(path)
 
 
+def find_by_qual(tree, qual: str):
+    """The function/class node with this dotted qualname (first match)."""
+    parts = qual.split(".")
+    nodes = [tree]
+    for part in parts:
+        if part == "<locals>":
+            continue
+        found = None
+        for cur in nodes:
+            for child in ast.walk(cur):
+                if isinstance(child, DEFS) and child.name == part and child is not cur:
+                    found = child
+                    break
+            if found is not None:
+                break
+        if found is None:
+            return None
+        nodes = [found]
+    return nodes[0] if nodes and nodes[0] is not tree else None
+
+
 def module_name(path: str) -> str:
     mod = path[:-3].replace("/", ".")
     if mod.endswith(".__init__"):
         mod = mod[: -len(".__init__")]
     return mod
+
+
+def _is_doc(stmt):
+    return isinstance(stmt, ast.Expr) and isinstance(getattr(stmt, "value", None), ast.Constant) and isinstance(stmt.value.value, str)
+
+
+def _span(node):
+    lo = node.lineno
+    if isinstance(node, DEFS) and node.decorator_list:
+        lo = min(lo, min(d.lineno for d in node.decorator_list))
+    return lo, node.end_lineno or lo
+
+
+def _touch(node, lines):
+    lo, hi = _span(node)
+    return any(lo <= ln <= hi for ln in lines)
+
+
+def _header(node):
+    if isinstance(node, ast.ClassDef):
+        return _strip(ast.ClassDef(name=node.name, bases=node.bases, keywords=node.keywords, body=[], decorator_list=node.decorator_list, type_params=getattr(node, "type_params", [])))
+    return _strip(type(node)(name=node.name, args=node.args, body=[], decorator_list=node.decorator_list, returns=node.returns, type_comment=None, type_params=getattr(node, "type_params", [])))
+
+
+def diff_kind(old_body, new_body, old_lines, new_lines):
+    """Compares two statement lists, looking only at statements that overlap the
+    changed lines. Returns "same", "doc" (only docstrings differ) or "code"."""
+    o = [i for i, s in enumerate(old_body) if _touch(s, old_lines)]
+    n = [i for i, s in enumerate(new_body) if _touch(s, new_lines)]
+    if not o and not n:
+        # only lines between statements changed (blank lines / comments)
+        return "same" if len(old_body) == len(new_body) else "code"
+    # untouched statements before the first change and after the last one are
+    # textually identical on both sides, so the windows line up
+    start = min(([min(o)] if o else []) + ([min(n)] if n else []))
+    tail = min(
+        len(old_body) - 1 - (max(o) if o else len(old_body) - 1),
+        len(new_body) - 1 - (max(n) if n else len(new_body) - 1),
+    )
+    start = min(start, len(old_body), len(new_body))
+    tail = max(0, min(tail, len(old_body) - start, len(new_body) - start))
+    wo = old_body[start: len(old_body) - tail]
+    wn = new_body[start: len(new_body) - tail]
+    if len(wo) != len(wn):
+        # a docstring added or removed at the top of the body is "doc"
+        a = wo[1:] if start == 0 and wo and _is_doc(wo[0]) else wo
+        b = wn[1:] if start == 0 and wn and _is_doc(wn[0]) else wn
+        if len(a) == len(b) and all(_strip(x) == _strip(y) for x, y in zip(a, b)):
+            return "doc"
+        return "code"
+    kind = "same"
+    for i, (a, b) in enumerate(zip(wo, wn)):
+        if type(a) is not type(b):
+            return "code"
+        if not _touch(a, old_lines) and not _touch(b, new_lines):
+            continue
+        if isinstance(a, DEFS):
+            if _header(a) != _header(b):
+                return "code"
+            k = diff_kind(a.body, b.body, old_lines, new_lines)
+        elif _is_doc(a) and _is_doc(b):
+            k = "same" if a.value.value == b.value.value else ("doc" if start + i == 0 else "code")
+        else:
+            k = "same" if _strip(a) == _strip(b) else "code"
+        if k == "code":
+            return "code"
+        if k == "doc":
+            kind = "doc"
+    return kind
+
+
+def local_sig(func):
+    """Names local to a function body (its own scope), and whether it yields/awaits.
+    Assigning a name anywhere in a function makes it local everywhere in it."""
+    names = set()
+    flags = set()
+    if not isinstance(func, ast.Lambda):
+        a = func.args
+        for arg in a.posonlyargs + a.args + a.kwonlyargs + ([a.vararg] if a.vararg else []) + ([a.kwarg] if a.kwarg else []):
+            names.add(arg.arg)
+    body = [func.body] if isinstance(func, ast.Lambda) else func.body
+    stack = list(body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+            stack.extend(node.decorator_list)
+            continue
+        if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            # walrus inside a comprehension binds in this scope
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name):
+                    names.add(sub.target.id)
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for al in node.names:
+                names.add((al.asname or al.name).split(".")[0])
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            flags.add((type(node).__name__, tuple(node.names)))
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        elif isinstance(node, (ast.Yield, ast.YieldFrom)):
+            flags.add("yield")
+        elif isinstance(node, ast.Await):
+            flags.add("await")
+        elif isinstance(node, ast.MatchAs) and node.name:
+            names.add(node.name)
+        elif isinstance(node, ast.MatchStar) and node.name:
+            names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.add(node.rest)
+        stack.extend(ast.iter_child_nodes(node))
+    return frozenset(names), frozenset(flags)
 
 
 def code_signature(source: str, filename: str):

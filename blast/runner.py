@@ -2,19 +2,43 @@
 
 The patched tree is a symlink farm in /tmp: every path the patch touches is a
 real file, everything else links to the pristine checkout (whose bytecode was
-compiled at build time). Tests run with unittest in a forked child, with a
-timer per test; a test that errors, fails, has a failing subtest, times out or
-whose module cannot be imported counts as failing.
+compiled at build time). Each verification forks from this process (which has
+already imported pytest and, when needed, the heavy third-party modules the
+tests use) and runs pytest in the child, so failures mean exactly what they
+mean for the labels: failure, error, failing subtest, timeout, import error.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import select
 import shutil
 import signal
 import sys
 import time
+
+_preloaded = set()
+
+
+def preload(heavy=False):
+    """Import what every verification needs once, in the parent."""
+    if "base" not in _preloaded:
+        import unittest  # noqa: F401
+
+        import pytest  # noqa: F401
+        import _pytest.unittest  # noqa: F401
+        import _pytest.subtests  # noqa: F401
+        import pytest_timeout  # noqa: F401
+
+        _preloaded.add("base")
+    if heavy and "heavy" not in _preloaded:
+        for mod in ("numpy", "pandas", "duckdb", "pandas.testing"):
+            try:
+                __import__(mod)
+            except Exception:
+                pass
+        _preloaded.add("heavy")
 
 
 def make_tree(repo, ws, changed):
@@ -22,7 +46,6 @@ def make_tree(repo, ws, changed):
     if os.path.exists(ws):
         shutil.rmtree(ws)
     os.makedirs(ws)
-    # directories that need to be real because something inside changes
     real_dirs = {""}
     for rel in changed:
         parts = rel.split("/")[:-1]
@@ -48,30 +71,45 @@ def make_tree(repo, ws, changed):
 
     fill("")
     for rel, text in changed.items():
-        dst = os.path.join(ws, rel)
         if text is None:
             continue
+        dst = os.path.join(ws, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         with open(dst, "w", encoding="utf-8") as f:
             f.write(text)
 
 
-class _Timeout(BaseException):
-    pass
+class _Collector:
+    def __init__(self, stop_on_fail):
+        self.ran = set()
+        self.failed = set()
+        self.broken = set()
+        self.stop = stop_on_fail
+        self.session = None
+
+    def pytest_sessionstart(self, session):
+        self.session = session
+
+    def pytest_runtest_logreport(self, report):
+        if report.when == "call":
+            self.ran.add(report.nodeid)
+        if report.failed:
+            self.failed.add(report.nodeid)
+            if self.stop and self.session is not None:
+                self.session.shouldstop = "first failure"
+
+    def pytest_collectreport(self, report):
+        if report.failed:
+            self.broken.add(report.nodeid)
+            if self.stop and self.session is not None:
+                self.session.shouldstop = "collection failure"
 
 
-def _child(ws, ids, timeouts, deadline, wfd):
-    import importlib
-    import pickle
-    import unittest
-
-    os.chdir(ws)
-    sys.path.insert(0, ws)
-    os.environ["SKIP_INTEGRATION"] = "0"
-
-    # Process pools: run the work here (with a pickle round trip, as a real
-    # pool would) so a verification never spawns interpreters.
+def _sync_pools():
+    """Process pools run their work in-process, with the pickle round trip a
+    real pool does, so a verification never spawns interpreters."""
     import concurrent.futures as cf
+    import pickle
 
     class SyncExecutor:
         def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
@@ -101,99 +139,33 @@ def _child(ws, ids, timeouts, deadline, wfd):
 
     cf.ProcessPoolExecutor = SyncExecutor
 
-    failed = set()
-    current = {"id": None}
 
-    def on_alarm(signum, frame):
-        raise _Timeout(f"timeout {current['id']}")
+def _child(ws, ids, timeout, stop_on_fail, wfd):
+    import pytest
 
-    signal.signal(signal.SIGALRM, on_alarm)
-
-    class Result(unittest.TestResult):
-        def __init__(self):
-            super().__init__()
-            self.bad = set()
-
-        def _id(self, test):
-            return getattr(test, "_blast_id", None)
-
-        def startTest(self, test):
-            super().startTest(test)
-            tid = self._id(test)
-            current["id"] = tid
-            left = deadline - time.time()
-            t = min(timeouts.get(tid, 10.0), max(0.05, left))
-            signal.setitimer(signal.ITIMER_REAL, t)
-
-        def stopTest(self, test):
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            super().stopTest(test)
-
-        def addError(self, test, err):
-            tid = self._id(test)
-            if tid is None:
-                # setUpClass / module fixture: every test of that class fails
-                self.bad.add(("fixture", str(test)))
-            else:
-                self.bad.add(tid)
-
-        def addFailure(self, test, err):
-            self.bad.add(self._id(test))
-
-        def addSubTest(self, test, subtest, err):
-            if err is not None:
-                self.bad.add(self._id(test))
-
-        def addUnexpectedSuccess(self, test):
-            self.bad.add(self._id(test))
-
-    by_mod = {}
-    for tid in ids:
-        path, cls, meth = tid.split("::")
-        by_mod.setdefault(path, {}).setdefault(cls, []).append((meth, tid))
-
-    for path, classes in by_mod.items():
-        modname = path[:-3].replace("/", ".")
-        try:
-            mod = importlib.import_module(modname)
-        except BaseException:  # noqa: BLE001
-            for cls, items in classes.items():
-                failed.update(t for _, t in items)
-            continue
-        for cls, items in classes.items():
-            if time.time() > deadline:
-                failed.update(t for _, t in items)
-                continue
-            try:
-                klass = getattr(mod, cls)
-                suite = unittest.TestSuite()
-                for meth, tid in items:
-                    case = klass(meth)
-                    case._blast_id = tid
-                    suite.addTest(case)
-                result = Result()
-                suite.run(result)
-                unittest.suite._call_if_exists(result, "_tearDownPreviousClass")
-                for b in result.bad:
-                    if isinstance(b, tuple) or b is None:
-                        failed.update(t for _, t in items)
-                    else:
-                        failed.add(b)
-                for test, _ in result.skipped:
-                    pass
-            except _Timeout:
-                failed.update(t for _, t in items)
-            except BaseException:  # noqa: BLE001
-                failed.update(t for _, t in items)
-    signal.setitimer(signal.ITIMER_REAL, 0)
-    os.write(wfd, json.dumps(sorted(failed)).encode())
+    os.chdir(ws)
+    sys.path.insert(0, ws)
+    os.environ["SKIP_INTEGRATION"] = "0"
+    _sync_pools()
+    col = _Collector(stop_on_fail)
+    args = [
+        "-q", "-p", "no:cacheprovider", "-p", "no:randomly", "--assert=plain",
+        "-o", "console_output_style=classic", "--no-header", "--tb=no",
+        "--timeout", str(timeout), "--rootdir", ws, "-c", os.devnull,
+    ] + list(ids)
+    try:
+        pytest.main(args, plugins=[col])
+    except BaseException:  # noqa: BLE001
+        pass
+    out = {"failed": sorted(col.failed), "broken": sorted(col.broken), "ran": sorted(col.ran)}
+    os.write(wfd, json.dumps(out).encode())
     os.close(wfd)
 
 
-def run(ws, ids, timeouts, budget):
-    """Fork, run ids in ws, return (failed_ids or None on crash, cpu_seconds)."""
+def run(ws, ids, timeout, budget, stop_on_fail=True):
+    """Fork and run ids in ws. Returns {"failed": [...], "broken": [...]} or None."""
     if not ids:
-        return set(), 0.0
+        return {"failed": [], "broken": []}
     r, w = os.pipe()
     deadline = time.time() + budget
     sys.stdout.flush()
@@ -201,35 +173,34 @@ def run(ws, ids, timeouts, budget):
     pid = os.fork()
     if pid == 0:
         os.close(r)
-        # stdout belongs to the answers: send everything the tests print to stderr
+        code = 0
         try:
+            # stdout carries the answers: anything the tests print goes to stderr
             os.dup2(2, 1)
-            _child(ws, ids, timeouts, deadline, w)
+            _child(ws, ids, timeout, stop_on_fail, w)
         except BaseException:  # noqa: BLE001
-            os._exit(3)
-        os._exit(0)
+            code = 3
+        os._exit(code)
     os.close(w)
     chunks = []
     killed = False
-    import select
-
     while True:
-        left = deadline + 2.0 - time.time()
+        left = deadline - time.time()
         if left <= 0:
             os.kill(pid, signal.SIGKILL)
             killed = True
             break
         rl, _, _ = select.select([r], [], [], left)
         if rl:
-            b = os.read(r, 65536)
+            b = os.read(r, 1 << 16)
             if not b:
                 break
             chunks.append(b)
     os.close(r)
-    _, status = os.waitpid(pid, 0)
+    os.waitpid(pid, 0)
     if killed or not chunks:
         return None
     try:
-        return set(json.loads(b"".join(chunks)))
+        return json.loads(b"".join(chunks))
     except ValueError:
         return None

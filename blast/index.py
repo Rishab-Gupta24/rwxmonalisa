@@ -95,6 +95,28 @@ def build(root):
             if summ is None:
                 summ = cache[line] = ctx_summary(tree, line)
             refs.setdefault(name, []).append((rel, summ, base))
+    # only names bound at module or class level are ever looked up
+    def_names = set()
+    for rel, full in _iter_py(root):
+        try:
+            tree = ast.parse(open(full, encoding="utf-8").read())
+        except Exception:
+            continue
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            for stmt in node.body:
+                def_names |= bound_names(stmt)
+                if isinstance(stmt, ast.ClassDef):
+                    stack.append(stmt)
+                    def_names.add(stmt.name)
+                elif isinstance(stmt, (ast.If, ast.Try)):
+                    stack.append(stmt)
+            for extra in ("orelse", "finalbody"):
+                for stmt in getattr(node, extra, []) or []:
+                    def_names |= bound_names(stmt)
+    refs = {k: v for k, v in refs.items() if k in def_names}
+    strs = {k: v for k, v in strs.items() if k in def_names}
     return {"refs": refs, "strs": strs, "from_imports": from_imports}
 
 

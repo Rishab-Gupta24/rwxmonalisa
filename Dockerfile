@@ -22,6 +22,7 @@ COPY data /app/data
 # read-only runtime never compiles an unchanged file.
 RUN cd /app && python -m blast.index /opt/sqlglot /app/data/index.pkl \
  && python -m compileall -q -j 4 /opt/sqlglot/sqlglot /opt/sqlglot/tests /app/blast \
+ && python -m blast.importtrace /opt/sqlglot /app/data/imports.pkl \
  && chmod -R a+rX /app /opt/sqlglot
 
 WORKDIR /app

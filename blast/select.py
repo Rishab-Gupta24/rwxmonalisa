@@ -6,14 +6,19 @@ import ast
 import os
 
 from .analyze import (
-    FUNC, DEFS, apply_patch, bound_names, code_signature, doc_free_dump, func_span, locate,
-    module_name, parse_patch, qualname_of, stmt_span, _strip,
+    FUNC, DEFS, apply_patch, bound_names, diff_kind, find_by_qual, func_span, local_sig, locate,
+    module_name, parse_patch, qualname_of, stmt_span,
 )
 
 
 class Selector:
-    def __init__(self, data, index, repo):
+    def __init__(self, data, index, repo, import_lines=None):
         self.repo = repo
+        self.import_lines = {}
+        for path, line in import_lines or ():
+            self.import_lines.setdefault(path, set()).add(line)
+        self.hot = {}
+        self.hot_ok = True
         self.ids = data["ids"]
         self.n = len(self.ids)
         self.ALL = (1 << self.n) - 1
@@ -217,10 +222,18 @@ class Selector:
 
     # ------------------------------------------------------------------ main entry
     def select(self, patch_text):
+        """Returns (mask, notes). Afterwards self.hot_ok says whether every edit
+        can be hot-patched, and self.hot maps each edited file to its new text."""
+        self.hot = {}
+        self.hot_ok = True
+        self.regions = []  # one mask per changed region (whole files for coarse cases)
         notes = []
         mask = 0
         for fp in parse_patch(patch_text):
+            before = len(self.regions)
             m, note = self.file_mask(fp)
+            if len(self.regions) == before and m:
+                self.regions.append(m)
             mask |= m
             notes.append(note)
         return mask, notes
@@ -231,64 +244,144 @@ class Selector:
         if not path:
             return 0, "nopath"
         opened = self.files.get(old_path or path, 0) | self.files.get(path, 0)
-        if not path.endswith(".py"):
+        is_py = (old_path or path).endswith(".py") or path.endswith(".py")
+        in_repo = any(p and (p.startswith("sqlglot/") or p.startswith("tests/")) for p in (old_path, fp.new_path))
+        if not is_py:
+            if opened:
+                self.hot_ok = False
             return opened, f"data {path}"
-        if not (path.startswith("sqlglot/") or path.startswith("tests/")):
+        if not in_repo:
             return opened, f"other {path}"
+        self.hot_ok_file = False
         if old_path is None:
+            self.hot_ok = False
             # a new module: only matters if something imports it
             return opened, f"new {path}"
         old_src = self.source(old_path)
         if old_src is False:
+            self.hot_ok = False
             return opened | self.ALL, f"unreadable {path}"
-        if fp.new_path is None:
+        if fp.new_path is None or fp.new_path != old_path:
+            self.hot_ok = False
+            # deleted or renamed: the old module can no longer be imported
             return opened | self.import_breaks(old_path), f"deleted {path}"
         new_src, removed, inserted, added = apply_patch(old_src, fp)
         old_tree = self.tree(old_path)
         try:
             new_tree = ast.parse(new_src)
-        except SyntaxError:
+        except (SyntaxError, ValueError):
+            self.hot_ok = False
             return opened | self.import_breaks(old_path), f"syntax {path}"
         if old_tree is False:
+            self.hot_ok = False
             return opened | self.ALL, f"oldparse {path}"
-        if _strip(old_tree) == _strip(new_tree):
+        old_touch = set(removed)
+        for k in inserted:
+            old_touch.add(k)
+            old_touch.add(k + 1)
+        dk = diff_kind(old_tree.body, new_tree.body, old_touch, added)
+        if dk == "same":
             return opened, f"format {path}"
         mask = opened
-        if doc_free_dump(ast.parse(old_src)) == doc_free_dump(ast.parse(new_src)):
+        if dk == "doc":
             # docstring-only edit: readers of the source and doc tests
             mask |= self.file_cov_tests(path, "tests/test_docs.py")
             return mask, f"docstring {path}"
 
-        sig_old = sig_new = None
-        regions = []
-        for ln in sorted(removed):
-            regions.append(("line", ln))
-        for k in sorted(inserted):
-            regions.append(("insert", k))
-
+        regions = [("line", ln) for ln in sorted(removed)] + [("insert", k) for k in sorted(inserted)]
         kinds = []
+        sig_checked = set()
+        hot = True
+        imp = self.import_lines.get(old_path, ())
         for kind, ln in regions:
-            if kind == "line":
-                ctx = locate(old_tree, ln)
-            else:
-                # an insertion between old k and k+1: the context of the next
-                # old line, unless that is shallower than the previous one
-                ctx = self._insert_ctx(old_tree, ln)
+            ctx = locate(old_tree, ln) if kind == "line" else self._insert_ctx(old_tree, ln)
+            if ctx.kind != "body" or (kind == "line" and ctx.stmt is None):
+                hot = False
+            elif imp:
+                lo, hi = stmt_span(ctx.stmt) if kind == "line" else (ln, ln + 1)
+                if any(lo <= x <= hi for x in imp):
+                    hot = False
             m, why = self.ctx_mask(path, old_tree, ctx, kind, new_tree, new_src, ln)
-            if why == "body" and sig_old is None:
-                sig_old = code_signature(old_src, path)
-                sig_new = code_signature(new_src, path)
-            if why == "body" and sig_old is not None and sig_new is not None and ctx.func is not None:
-                q = self._func_qual(old_tree, ctx.func)
-                if q is not None and sig_old.get(q) != sig_new.get(q):
-                    m |= self._func_mask(path, ctx.func)
-                    why = "body+locals"
+            if why == "body" and ctx.func is not None and not isinstance(ctx.func, ast.Lambda):
+                if id(ctx.func) not in sig_checked:
+                    sig_checked.add(id(ctx.func))
+                    if self._locals_changed(old_tree, new_tree, ctx.func):
+                        m |= self._func_mask(path, ctx.func)
+                        why = "body+locals"
+            self.regions.append(m)
             mask |= m
             kinds.append(why)
-        if path in self.collect and set(kinds) - {"body", "func", "body+locals", "const"}:
+        # added class/module-level statements: what the new code binds matters
+        # too (a renamed attribute, a new override, a new global)
+        seen_new = set()
+        for ln in sorted(added):
+            nctx = locate(new_tree, ln)
+            if nctx.kind not in ("class", "module"):
+                continue
+            key = (nctx.kind, id(nctx.stmt), id(nctx.cls))
+            if key in seen_new:
+                continue
+            seen_new.add(key)
+            m, why = self.new_def_mask(path, old_tree, nctx)
+            self.regions.append(m)
+            mask |= m
+            kinds.append(why)
+            hot = False
+        if hot and self.import_lines:
+            self.hot[old_path] = new_src
+        else:
+            self.hot_ok = False
+        if path in self.collect and set(kinds) - {"body", "func", "body+locals", "const", "newtest"}:
             # import-time behaviour changed: fresh-interpreter tests can see it
             mask |= self.subproc
         return mask, f"{path}: {','.join(sorted(set(kinds)))}"
+
+    def new_def_mask(self, path, old_tree, nctx):
+        stmt = nctx.stmt
+        if nctx.kind == "module":
+            if stmt is None:
+                return self.module_users(path), "new-module?"
+            if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                return self.import_breaks(path) | self.refs_of(path, bound_names(stmt)), "new-import"
+            names = bound_names(stmt)
+            if not names:
+                if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+                    return 0, "const"
+                return self.module_users(path), "new-module"
+            m = self.refs_of(path, names)
+            if path.startswith("tests/"):
+                m |= self.test_file.get(path, 0) & self.file_cov(path)
+            return m, "new-global"
+        qual = ".".join(nctx.classes)
+        old_cls = find_by_qual(old_tree, qual)
+        if old_cls is None or not isinstance(old_cls, ast.ClassDef):
+            # inside a class the old file does not have: a new top-level binding
+            top = nctx.classes[0]
+            return self.refs_of(path, {top}), "new-class"
+        names = bound_names(stmt) if stmt is not None else set()
+        if path.startswith("tests/"):
+            old_names = set()
+            for s in old_cls.body:
+                old_names |= bound_names(s)
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name.startswith("test") \
+                    and stmt.name not in old_names:
+                return 0, "newtest"  # a new test method: not in tests.json, touches no other test
+            return self.class_users(path, qual) | self.cov(path, *func_span(old_cls)), "new-class-attr"
+        m = self.class_users(path, qual)
+        if names and isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            readers = self.attr_readers(names)
+            if readers is not None:
+                m &= readers
+        if names:
+            m |= self.attr_refs(path, qual, names)
+        return m, "new-class-attr"
+
+    def _locals_changed(self, old_tree, new_tree, func):
+        qual = qualname_of(old_tree, func)
+        new_func = find_by_qual(new_tree, qual)
+        if new_func is None:
+            return True
+        return local_sig(func) != local_sig(new_func)
 
     def file_cov_tests(self, path, test_path):
         return self.test_file.get(test_path, 0) & self.module_users(path)

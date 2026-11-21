@@ -15,6 +15,10 @@ class Selector:
     def __init__(self, data, index, repo, import_lines=None):
         self.repo = repo
         self.import_lines = {}
+        self.import_mods = {}
+        if isinstance(import_lines, dict):
+            self.import_mods = import_lines.get("mods", {})
+            import_lines = import_lines.get("lines", ())
         for path, line in import_lines or ():
             self.import_lines.setdefault(path, set()).add(line)
         self.hot = {}
@@ -81,6 +85,22 @@ class Selector:
         if "." in qual:
             outer = qual.rsplit(".", 1)[0]
             m |= self.types.get(f"{module_name(path)}:{outer}", 0)
+        return m
+
+    def unseen_class(self, path, qual):
+        """A sqlglot class no test was seen instantiating (enums, dataclasses,
+        constant holders): class users say nothing about who depends on it."""
+        if path.startswith("tests/"):
+            return False
+        return f"{module_name(path)}:{qual}" not in self.types
+
+    def unseen_mask(self, path, qual, names):
+        top = qual.split(".")[0]
+        m = self.module_users(path) | self.refs_of(path, {top})
+        if names:
+            m |= self.attr_refs(path, qual, names)
+        # members looked up by string (Enum["X"], dialect names) reach any user
+        # of the class name anywhere
         return m
 
     def attr_readers(self, names):
@@ -367,6 +387,8 @@ class Selector:
                     and stmt.name not in old_names:
                 return 0, "newtest"  # a new test method: not in tests.json, touches no other test
             return self.class_users(path, qual) | self.cov(path, *func_span(old_cls)), "new-class-attr"
+        if self.unseen_class(path, qual):
+            return self.unseen_mask(path, qual, names), "new-class-unseen"
         m = self.class_users(path, qual)
         if names and isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             readers = self.attr_readers(names)
@@ -375,6 +397,33 @@ class Selector:
         if names:
             m |= self.attr_refs(path, qual, names)
         return m, "new-class-attr"
+
+    def import_effect(self, path, lo, hi):
+        """Lines of a function body that run while modules are imported shape what
+        those modules build: every user of those modules can see a change there."""
+        lines = self.import_lines.get(path)
+        if not lines:
+            return 0
+        mods = set()
+        for ln in range(lo, hi + 1):
+            if ln in lines:
+                mods.update(self.import_mods.get((path, ln), ()))
+        m = 0
+        for mod in mods:
+            if mod.startswith("tests/"):
+                m |= self.test_file.get(mod, 0) | self.file_cov(mod)
+            else:
+                m |= self.module_users(mod)
+        if mods:
+            m |= self.subproc
+        return m
+
+    def _func_import_effect(self, path, f):
+        if isinstance(f, ast.Lambda):
+            return self.import_effect(path, f.body.lineno, f.body.end_lineno)
+        if not f.body:
+            return 0
+        return self.import_effect(path, f.body[0].lineno, f.end_lineno)
 
     def _locals_changed(self, old_tree, new_tree, func):
         qual = qualname_of(old_tree, func)
@@ -415,13 +464,16 @@ class Selector:
     def ctx_mask(self, path, old_tree, ctx, kind, new_tree, new_src, ln):
         if ctx.kind == "body":
             if kind == "insert" or ctx.stmt is None:
-                return self._func_mask(path, ctx.func), "func"
+                return self._func_mask(path, ctx.func) | self._func_import_effect(path, ctx.func), "func"
             lo, hi = stmt_span(ctx.stmt)
-            return self.cov(path, lo, hi), "body"
+            return self.cov(path, lo, hi) | self.import_effect(path, lo, hi), "body"
         if ctx.kind == "header":
-            return self._func_mask(path, ctx.func), "func"
+            return self._func_mask(path, ctx.func) | self._func_import_effect(path, ctx.func), "func"
         if ctx.kind == "class":
             qual = ".".join(ctx.classes)
+            if self.unseen_class(path, qual):
+                names = bound_names(ctx.stmt) if ctx.stmt is not None else set()
+                return self.unseen_mask(path, qual, names), "class-unseen"
             m = self.class_users(path, qual)
             if ctx.stmt is not None:
                 names = bound_names(ctx.stmt)
@@ -447,6 +499,9 @@ class Selector:
             m = self.refs_of(path, names)
             if path.startswith("tests/"):
                 m |= self.test_file.get(path, 0) & self.file_cov(path)
+            if not m:
+                # no reference found (aliased import, dynamic access): be broad
+                return self.module_users(path), "global?"
             return m, "global"
         if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
             return 0, "const"

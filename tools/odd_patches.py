@@ -43,6 +43,9 @@ def main():
     p["decorator"] = sub(repo, "sqlglot/expressions/core.py", "    @property\n", "    @property  \n", 1)
     p["moduleconst"] = sub(repo, "sqlglot/optimizer/simplify.py", "FINAL = \"final\"", "FINAL = \"finals\"") if 'FINAL = "final"' in open(os.path.join(repo, "sqlglot/optimizer/simplify.py")).read() else ""
     p["jsonfix"] = ""
+    p["enumdialects"] = sub(repo, "sqlglot/dialects/dialect.py", 'TSQL = "tsql"', 'TSQL = "tsqll"') if 'TSQL = "tsql"' in open(os.path.join(repo, "sqlglot/dialects/dialect.py")).read() else ""
+    dsrc = open(os.path.join(repo, "sqlglot/expressions/datatypes.py")).read()
+    p["enumdtype"] = sub(repo, "sqlglot/expressions/datatypes.py", "    TEXT = auto()", "    TEXT = auto()\n    TEXTX = auto()") if "    TEXT = auto()" in dsrc else ""
     for name, text in p.items():
         if text:
             open(os.path.join(out, name + ".patch"), "w", encoding="utf-8").write(text)
